@@ -1379,6 +1379,68 @@ Beyond the servers themselves:
 - [ ] **Git access** (deploy keys or tokens) for any private app repositories
 - [ ] **Container registry** credentials
 
+
+## Part 17 — DNS: `/etc/hosts` overrides for Server-1-to-Server-2 hostname resolution
+
+[#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution)
+
+After correcting the sites wildcard DNS record to point at Server 1 ([Part 15](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2)), every subdomain under
+that same wildcard — including the App Server's own hostname (`f1.sites.example.com`) and the
+Database Server's (`db.sites.example.com`) — now also resolves to Server 1's IP, since a
+single-provider wildcard DNS record cannot point different subdomains at different IPs.
+
+### Symptom
+
+[#symptom-2](#symptom-2)
+
+`Agent Job`s targeting the App Server (e.g. `New Site`) stay `Undelivered` or `Pending`
+indefinitely, even though the agent itself responds correctly when tested directly by IP:
+
+```
+curl -sk -o /dev/null -w "%{http_code}\n" -H "Authorization: bearer AGENT_PASSWORD" -H "Host: f1.sites.example.com" https://SERVER2_IP/agent/ping
+# 200 — the agent is healthy
+
+getent hosts f1.sites.example.com
+resolves to Server 1's IP — wrong
+
+### Fix
+
+[#fix-2](#fix-2)
+
+On **Server 1** only — the machine Press itself runs on and dials outbound Agent requests
+from — add explicit overrides for every self-hosted server's own hostname, pointing each at its
+real IP:
+
+echo "SERVER2_IP f1.sites.example.com" | sudo tee -a /etc/hosts
+echo "SERVER2_IP db.sites.example.com" | sudo tee -a /etc/hosts
+
+
+The Proxy's own hostname (`n1.sites.example.com`) should instead resolve to `127.0.0.1`, since it
+runs on Server 1 itself:
+
+echo "127.0.0.1 n1.sites.example.com" | sudo tee -a /etc/hosts
+
+
+> This only affects Server 1's own outbound resolution. External visitors still resolve the
+> wildcard normally through public DNS and reach the Proxy correctly, which then routes
+> internally to Server 2 using the raw IP already baked into the generated nginx `upstream`
+> block — not a hostname. No visitor-facing behavior changes.
+
+Verify, then retry any stuck jobs:
+
+getent hosts f1.sites.example.com # must now print SERVER2_IP
+
+bench --site press.example.com console
+
+job = frappe.get_doc("Agent Job", "STUCK_JOB_NAME")
+job.retry()
+frappe.db.commit()
+
+
+Allow a full "New Site" job a few minutes to complete (bench clone, database creation, app
+installation) — `Pending` for under a minute is normal, not a sign of failure.
+
+```
 ### On DNS access
 
 You do not need full registrar access. You need either someone who can add records on request,
