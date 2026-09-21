@@ -26,9 +26,13 @@ can apply them pre-emptively instead of discovering them one failed playbook at 
 - [Part 11 — Release Group](#part-11--release-group)
 - [Part 12 — Docker registry](#part-12--docker-registry)
 - [Part 13 — Deploy Candidate](#part-13--deploy-candidate)
-- [## Part 14 — Add Site to Proxy (Upstream Registration)]
+- [Part 14 — Add Site to Proxy (Upstream Registration)](#part-14--add-site-to-proxy-upstream-registration)
+- [Part 15 — DNS: point the sites domain at Server 1, not Server 2](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2)
+- [Part 16 — Static assets return 404 even though the files exist](#part-16--static-assets-return-404-even-though-the-files-exist)
+- [Part 17 — DNS: `/etc/hosts` overrides for Server-1-to-Server-2 hostname resolution](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution)
 - [Troubleshooting reference](#troubleshooting-reference)
 - [Production checklist](#production-checklist)
+- [Known open issues](#known-open-issues)
 
 ---
 
@@ -98,7 +102,11 @@ performance.
 > **DuckDNS note:** if testing with DuckDNS, register two separate domains (e.g. `mypress` and
 > `mypresssites`). The subdomain field accepts only `A-Z`, `0-9`, `-` — no dots. DuckDNS resolves
 > any subdomain under a registered domain to the same IP automatically, so
-> `n1.mypresssites.duckdns.org` works without separate registration.
+> `n1.mypresssites.duckdns.org` works without separate registration. **Important:** since every
+> subdomain under one DuckDNS domain shares the same single IP, that IP must point at **Server 1
+> (the Proxy)** — see [Part 15](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2)
+> and [Part 17](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution) for
+> what this means for Server 2's own hostname.
 
 ---
 
@@ -1064,15 +1072,13 @@ ssh root@SERVER2_IP "free -h | grep -i swap"
 
 ## Part 14 — Add Site to Proxy (Upstream Registration)
 
-[#part-14--add-site-to-proxy-upstream-registration](#part-14--add-site-to-proxy-upstream-registration)
-
 Not covered by any official guide. Found by grepping the `Server` doctype's client script:
 
-```
+```bash
 grep -n "add_upstream_to_proxy" ~/frappe-bench/apps/press/press/press/doctype/server/server.js
 ```
 
-```
+```javascript
 ['Add to Proxy', 'add_upstream_to_proxy', true, frm.doc.is_server_setup && !frm.doc.is_upstream_setup, __('Network')]
 ```
 
@@ -1082,16 +1088,14 @@ unreachable through the Proxy even if the site itself is `Active`.
 
 ### 14.1 Run it
 
-[#141-run-it](#141-run-it)
-
 From the **App Server** doc: **Actions → Add to Proxy**. If the button is not visible, run it
 directly:
 
-```
+```bash
 bench --site press.example.com console
 ```
 
-```
+```python
 server = frappe.get_doc("Server", "f1.sites.example.com")
 server.add_upstream_to_proxy()
 frappe.db.commit()
@@ -1104,11 +1108,9 @@ frappe.db.commit()
 
 ### 14.2 `401 Unauthenticated` despite a correct `agent_password`
 
-[#142-401-unauthenticated-despite-a-correct-agent_password](#142-401-unauthenticated-despite-a-correct-agent_password)
-
 The `Agent` class authenticates with:
 
-```
+```python
 password = get_decrypted_password(self.server_type, self.server, "agent_password")
 headers = {"Authorization": f"bearer {password}"}
 ```
@@ -1116,7 +1118,7 @@ headers = {"Authorization": f"bearer {password}"}
 The agent itself validates against a **pbkdf2_sha256 hash** stored in `access_token` inside its
 own `config.json` — not the plaintext:
 
-```
+```python
 stored_hash = Server().config["access_token"]
 if method.lower() == "bearer" and pbkdf2.verify(access_token, stored_hash):
     return None
@@ -1127,7 +1129,7 @@ though `get_password("agent_password")` and the value you set are identical stri
 
 **Regenerate both sides correctly:**
 
-```
+```bash
 sudo /home/frappe/agent/env/bin/python3 -c "
 from passlib.hash import pbkdf2_sha256
 import secrets
@@ -1141,7 +1143,7 @@ Write the hash into the agent's config using a **single-quoted heredoc**, never
 `python3 -c "..."` with double quotes — bash expands every `$` in a pbkdf2 hash
 (`$pbkdf2-sha256$29000$...`) as a shell variable and silently mangles the string:
 
-```
+```bash
 sudo tee /tmp/fix_token.py > /dev/null << 'PYEOF'
 import json
 path = '/home/frappe/agent/config.json'
@@ -1159,7 +1161,7 @@ sudo chown frappe:frappe /home/frappe/agent/config.json
 
 Put the **plaintext** in the `Proxy Server` doc:
 
-```
+```python
 proxy = frappe.get_doc("Proxy Server", "n1.sites.example.com")
 proxy.agent_password = "PASTE_PLAINTEXT_HERE"
 proxy.save()
@@ -1168,7 +1170,7 @@ frappe.db.commit()
 
 **Then kill the agent's gunicorn master, not just its supervisor entry:**
 
-```
+```bash
 sudo pkill -9 -f "gunicorn --bind 127.0.0.1:25052"
 sudo supervisorctl start agent:web
 ```
@@ -1178,7 +1180,7 @@ sudo supervisorctl start agent:web
 > keeps serving the stale `access_token` indefinitely. Confirm the fix took by checking the PIDs
 > changed:
 >
-> ```
+> ```bash
 > ps aux | grep "agent.web" | grep -v grep
 > ```
 >
@@ -1186,9 +1188,7 @@ sudo supervisorctl start agent:web
 
 ### 14.3 Verify the nginx upstream was actually written
 
-[#143-verify-the-nginx-upstream-was-actually-written](#143-verify-the-nginx-upstream-was-actually-written)
-
-```
+```bash
 sudo find /home/frappe/agent/nginx/upstreams -type f
 sudo grep -n "SITE_NAME\|SERVER2_IP" /etc/nginx/conf.d/proxy.conf
 ```
@@ -1206,14 +1206,10 @@ hostname to that upstream. `/etc/nginx/conf.d/proxy.conf` is generated and alrea
 
 ## Part 15 — DNS: point the sites domain at Server 1, not Server 2
 
-[#part-15--dns-point-the-sites-domain-at-server-1-not-server-2](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2)
-
 **The wildcard `*.sites.example.com` must resolve to Server 1's IP (the Proxy), not Server 2.**
 This is easy to get backwards since Server 2 is where the sites' data and files actually live.
 
 ### Symptom
-
-[#symptom](#symptom)
 
 Visiting any site under the wildcard shows:
 
@@ -1229,8 +1225,6 @@ has no reason to know about routing rules that only exist in the Proxy's config.
 
 ### Why pointing it at Server 1 doesn't break anything internal
 
-[#why-pointing-it-at-server-1-doesnt-break-anything-internal](#why-pointing-it-at-server-1-doesnt-break-anything-internal)
-
 Every internal connection Press and the agents make to each other already uses **raw IPs**, never
 the wildcard hostname:
 
@@ -1244,8 +1238,6 @@ per-site routing rules and the wildcard TLS certificate.
 
 ### Fix
 
-[#fix](#fix)
-
 In your DNS provider (DuckDNS or otherwise), point the `sites.example.com` record at **Server
 1's IP**, not Server 2's. If you're using DuckDNS with a wildcard-style setup where multiple
 subdomains share one registered domain, there's only one IP for that domain — make sure it's
@@ -1253,36 +1245,32 @@ Server 1's.
 
 Flush your local resolver cache and re-check before assuming it hasn't propagated:
 
-```
+```bash
 nslookup somesite.sites.example.com
 ```
 
-Expect Server 1's IP. If you have a stale record baked into `/etc/hosts` on Server 1 itself from
-earlier troubleshooting (pointing the hostname at `127.0.0.1` as a workaround), it's safe to
-remove once the real DNS record is corrected — but harmless to leave, since it only affects
-Server 1's own outbound requests to that hostname.
+Expect Server 1's IP.
+
+> Changing this DNS record has a side effect covered in
+> [Part 17](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution) —
+> Server 2's own hostname (`f1.sites.example.com`, `db.sites.example.com`) will now *also*
+> resolve to Server 1, which breaks Press's direct connections to those servers unless corrected.
 
 ---
 
 ## Part 16 — Static assets return 404 even though the files exist
 
-[#part-16--static-assets-return-404-even-though-the-files-exist](#part-16--static-assets-return-404-even-though-the-files-exist)
-
 ### Symptom
-
-[#symptom-1](#symptom-1)
 
 The site's HTML loads (`200`), but every `/assets/...` request — CSS, JS, fonts — comes back
 `404`, even though the files are confirmed present on disk with normal `644` permissions:
 
-```
+```bash
 curl -s -o /dev/null -w "%{http_code}\n" https://mysite.sites.example.com/assets/frappe/dist/css/website.bundle.XXXXXXXX.css
 # 404
 ```
 
 ### Cause
-
-[#cause](#cause)
 
 The site's nginx `location /assets { try_files $uri =404; }` block has `root
 /home/frappe/benches/BENCH_NAME/sites;` — correct. But `/home/frappe` itself is created `750`
@@ -1293,7 +1281,7 @@ reports this as `404`, not `403`.
 
 Confirm with:
 
-```
+```bash
 namei -l /home/frappe/benches/BENCH_NAME/sites/assets/frappe/dist/css/website.bundle.XXXXXXXX.css
 ```
 
@@ -1302,9 +1290,7 @@ both owner and group is the tell.
 
 ### Fix
 
-[#fix-1](#fix-1)
-
-```
+```bash
 sudo usermod -aG frappe www-data
 sudo systemctl restart nginx
 ```
@@ -1318,31 +1304,83 @@ not need repeating for future sites deployed on the same server.
 
 ---
 
-## Troubleshooting reference — additions
+## Part 17 — DNS: `/etc/hosts` overrides for Server-1-to-Server-2 hostname resolution
 
-[#troubleshooting-reference--additions](#troubleshooting-reference--additions)
+After correcting the sites wildcard DNS record to point at Server 1 ([Part 15](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2)), every subdomain under
+that same wildcard — including the App Server's own hostname (`f1.sites.example.com`) and the
+Database Server's (`db.sites.example.com`) — now also resolves to Server 1's IP, since a
+single-provider wildcard DNS record cannot point different subdomains at different IPs.
 
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| Site is `Active` but "Are you lost? This address does not point to a site on Frappe Cloud." | Wildcard DNS resolves to the App/DB server instead of the Proxy | Point the sites wildcard at Server 1 — [Part 15](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2) |
-| `Agent Job` fails with `401 Unauthenticated` even though the stored `agent_password` matches | Stale gunicorn **master** process still serving an old `access_token`; or the hash was corrupted by unquoted `$` in a `python3 -c "..."` call | `pkill -9` the agent gunicorn master, not `supervisorctl restart`; always write secrets via single-quoted heredocs — [14.2](#142-401-unauthenticated-despite-a-correct-agent_password) |
-| `nginx: [emerg] "real_ip_header" directive is duplicate` | Manually added an `include` for `/home/frappe/agent/nginx/proxy.conf`, which is already included via `/etc/nginx/conf.d/proxy.conf` | Remove the manual include — [14.3](#143-verify-the-nginx-upstream-was-actually-written) |
-| Site HTML loads but all CSS/JS return `404` despite files existing on disk | `/home/frappe` is `750`; `www-data` (nginx) can't traverse into it | `usermod -aG frappe www-data` + `systemctl restart nginx` — [Part 16](#part-16--static-assets-return-404-even-though-the-files-exist) |
-| `Add to Proxy` / `add_upstream_to_proxy()` returns no exception but `is_upstream_setup` stays `0` | The flag is set asynchronously and isn't a reliable success signal | Verify via [14.3](#143-verify-the-nginx-upstream-was-actually-written) instead of the flag |
+### Symptom
+
+`Agent Job`s targeting the App Server (e.g. `New Site`, `Add Site to Upstream`) stay
+`Undelivered` or stuck `Pending` indefinitely, even though the agent itself responds correctly
+when tested directly by IP:
+
+```bash
+curl -sk -o /dev/null -w "%{http_code}\n" -H "Authorization: bearer AGENT_PASSWORD" -H "Host: f1.sites.example.com" https://SERVER2_IP/agent/ping
+# 200 — the agent is healthy
+```
+
+```bash
+getent hosts f1.sites.example.com
+# resolves to Server 1's IP — wrong
+```
+
+A related symptom: manually curling `https://f1.sites.example.com/agent/...` returns a `307`
+redirect to the dashboard's "new site" page instead of an agent response — that redirect is the
+Proxy on Server 1 not recognising `f1` as one of its own routes, because the request landed on
+Server 1 by DNS accident rather than being deliberately proxied there.
+
+### Fix
+
+On **Server 1** only — the machine Press itself runs on and dials outbound Agent requests
+from — add explicit overrides for every self-hosted server's own hostname, pointing each at its
+real IP:
+
+```bash
+echo "SERVER2_IP f1.sites.example.com" | sudo tee -a /etc/hosts
+echo "SERVER2_IP db.sites.example.com" | sudo tee -a /etc/hosts
+```
+
+The Proxy's own hostname (`n1.sites.example.com`) should instead resolve to `127.0.0.1`, since it
+runs on Server 1 itself:
+
+```bash
+echo "127.0.0.1 n1.sites.example.com" | sudo tee -a /etc/hosts
+```
+
+> This only affects Server 1's own outbound resolution. External visitors still resolve the
+> wildcard normally through public DNS and reach the Proxy correctly, which then routes
+> internally to Server 2 using the raw IP already baked into the generated nginx `upstream`
+> block — not a hostname. No visitor-facing behavior changes.
+
+Verify, then retry any stuck jobs:
+
+```bash
+getent hosts f1.sites.example.com    # must now print SERVER2_IP
+```
+
+```bash
+bench --site press.example.com console
+```
+
+```python
+job = frappe.get_doc("Agent Job", "STUCK_JOB_NAME")
+job.retry()
+frappe.db.commit()
+```
+
+Allow a full "New Site" job a few minutes to complete (bench clone, database creation, app
+installation) — `Pending` for under a minute is normal, not a sign of failure. Also confirm the
+bench workers on Server 1 are actually running, since a stuck-forever (not just slow) job is
+usually a dead worker rather than a DNS problem:
+
+```bash
+sudo supervisorctl status | grep worker
+```
 
 ---
-
-## Known open issues — additions
-
-[#known-open-issues--additions](#known-open-issues--additions)
-
-- **`is_upstream_setup` flag** — does not reliably reflect whether the upstream registration
-  succeeded; verify against the actual generated nginx config instead.
-- **Agent gunicorn master caching** — any change to `/home/frappe/agent/config.json` requires
-  killing the master process outright (`pkill -9 -f "gunicorn --bind 127.0.0.1:25052"`), not a
-  supervisor-level restart, or the change is silently ignored indefinitely.
-- **`www-data` / `frappe` group separation** — a fresh unified server will need the
-  `usermod -aG frappe www-data` fix applied once before the *first* site's assets will load.
 
 ## Troubleshooting reference
 
@@ -1364,6 +1402,12 @@ not need repeating for future sites deployed on the same server.
 | `unknown directive "vhost_traffic_status_display"` | VTS module unavailable on Noble | [8.1](#81-run-setup-server) |
 | `/usr/bin/python3.14` not found | agent version-resolution bug | [Part 13](#part-13--deploy-candidate) |
 | `denied: requested access to the resource` | registry namespace case mismatch | [Part 12](#part-12--docker-registry) |
+| Site is `Active` but "Are you lost? This address does not point to a site on Frappe Cloud." | Wildcard DNS resolves to the App/DB server instead of the Proxy | Point the sites wildcard at Server 1 — [Part 15](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2) |
+| `Agent Job` fails with `401 Unauthenticated` even though the stored `agent_password` matches | Stale gunicorn **master** process still serving an old `access_token`; or the hash was corrupted by unquoted `$` in a `python3 -c "..."` call | `pkill -9` the agent gunicorn master, not `supervisorctl restart`; always write secrets via single-quoted heredocs — [14.2](#142-401-unauthenticated-despite-a-correct-agent_password) |
+| `nginx: [emerg] "real_ip_header" directive is duplicate` | Manually added an `include` for `/home/frappe/agent/nginx/proxy.conf`, which is already included via `/etc/nginx/conf.d/proxy.conf` | Remove the manual include — [14.3](#143-verify-the-nginx-upstream-was-actually-written) |
+| Site HTML loads but all CSS/JS return `404` despite files existing on disk | `/home/frappe` is `750`; `www-data` (nginx) can't traverse into it | `usermod -aG frappe www-data` + `systemctl restart nginx` — [Part 16](#part-16--static-assets-return-404-even-though-the-files-exist) |
+| `Add to Proxy` / `add_upstream_to_proxy()` returns no exception but `is_upstream_setup` stays `0` | The flag is set asynchronously and isn't a reliable success signal | Verify via [14.3](#143-verify-the-nginx-upstream-was-actually-written) instead of the flag |
+| `Agent Job`s to the App Server stay `Undelivered`/stuck `Pending` after fixing the sites wildcard DNS | Server 2's own hostname now also resolves to Server 1 | Add `/etc/hosts` overrides on Server 1 — [Part 17](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution) |
 
 ---
 
@@ -1379,68 +1423,6 @@ Beyond the servers themselves:
 - [ ] **Git access** (deploy keys or tokens) for any private app repositories
 - [ ] **Container registry** credentials
 
-
-## Part 17 — DNS: `/etc/hosts` overrides for Server-1-to-Server-2 hostname resolution
-
-[#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution)
-
-After correcting the sites wildcard DNS record to point at Server 1 ([Part 15](#part-15--dns-point-the-sites-domain-at-server-1-not-server-2)), every subdomain under
-that same wildcard — including the App Server's own hostname (`f1.sites.example.com`) and the
-Database Server's (`db.sites.example.com`) — now also resolves to Server 1's IP, since a
-single-provider wildcard DNS record cannot point different subdomains at different IPs.
-
-### Symptom
-
-[#symptom-2](#symptom-2)
-
-`Agent Job`s targeting the App Server (e.g. `New Site`) stay `Undelivered` or `Pending`
-indefinitely, even though the agent itself responds correctly when tested directly by IP:
-
-```
-curl -sk -o /dev/null -w "%{http_code}\n" -H "Authorization: bearer AGENT_PASSWORD" -H "Host: f1.sites.example.com" https://SERVER2_IP/agent/ping
-# 200 — the agent is healthy
-
-getent hosts f1.sites.example.com
-resolves to Server 1's IP — wrong
-
-### Fix
-
-[#fix-2](#fix-2)
-
-On **Server 1** only — the machine Press itself runs on and dials outbound Agent requests
-from — add explicit overrides for every self-hosted server's own hostname, pointing each at its
-real IP:
-
-echo "SERVER2_IP f1.sites.example.com" | sudo tee -a /etc/hosts
-echo "SERVER2_IP db.sites.example.com" | sudo tee -a /etc/hosts
-
-
-The Proxy's own hostname (`n1.sites.example.com`) should instead resolve to `127.0.0.1`, since it
-runs on Server 1 itself:
-
-echo "127.0.0.1 n1.sites.example.com" | sudo tee -a /etc/hosts
-
-
-> This only affects Server 1's own outbound resolution. External visitors still resolve the
-> wildcard normally through public DNS and reach the Proxy correctly, which then routes
-> internally to Server 2 using the raw IP already baked into the generated nginx `upstream`
-> block — not a hostname. No visitor-facing behavior changes.
-
-Verify, then retry any stuck jobs:
-
-getent hosts f1.sites.example.com # must now print SERVER2_IP
-
-bench --site press.example.com console
-
-job = frappe.get_doc("Agent Job", "STUCK_JOB_NAME")
-job.retry()
-frappe.db.commit()
-
-
-Allow a full "New Site" job a few minutes to complete (bench clone, database creation, app
-installation) — `Pending` for under a minute is normal, not a sign of failure.
-
-```
 ### On DNS access
 
 You do not need full registrar access. You need either someone who can add records on request,
@@ -1460,6 +1442,18 @@ or a scoped API token. The three things that require it:
   after agent updates.
 - **Certificate renewal** — the cron renews the files, but the `TLS Certificate` doc content must
   be refreshed separately. Worth scripting before the first renewal comes due.
+- **`is_upstream_setup` flag** — does not reliably reflect whether the upstream registration
+  succeeded; verify against the actual generated nginx config instead ([14.3](#143-verify-the-nginx-upstream-was-actually-written)).
+- **Agent gunicorn master caching** — any change to `/home/frappe/agent/config.json` requires
+  killing the master process outright (`pkill -9 -f "gunicorn --bind 127.0.0.1:25052"`), not a
+  supervisor-level restart, or the change is silently ignored indefinitely.
+- **`www-data` / `frappe` group separation** — a fresh unified server will need the
+  `usermod -aG frappe www-data` fix applied once before the *first* site's assets will load.
+- **Single wildcard DNS record covering both servers** — with providers like DuckDNS that only
+  offer one IP per registered domain, Server 2's own hostname will drift onto Server 1's IP any
+  time the wildcard is corrected. The `/etc/hosts` override in [Part 17](#part-17--dns-etchosts-overrides-for-server-1-to-server-2-hostname-resolution)
+  is a per-server-1 workaround, not a DNS-level fix; a provider or plan supporting distinct A
+  records per subdomain removes the need for it entirely.
 
 ---
 
